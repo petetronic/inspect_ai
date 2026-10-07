@@ -8,8 +8,17 @@ from inspect_ai.log._samples import (
     track_active_model_event,
 )
 from inspect_ai.log._transcript import Transcript, init_transcript
-from inspect_ai.model import GenerateConfig, ModelOutput, ModelRequestId
+from inspect_ai.model import (
+    GenerateConfig,
+    ModelOutput,
+    ModelRequestId,
+    record_response_headers,
+)
 from inspect_ai.model._providers.util.hooks import HttpHooks
+from inspect_ai.model._response_headers import (
+    ResponseHeaders,
+    track_response_headers,
+)
 
 
 def test_set_active_model_event_call_notifies_transcript():
@@ -133,3 +142,34 @@ def test_request_ids_ignored_without_active_model_event():
     hooks.record_response(request_id, 200, {"x-request-id": "req_no_event"})
 
     assert hooks._requests[request_id].last_status == 200
+
+
+def test_response_headers_recorded_are_the_latest_attempts():
+    """A model call's response headers are those of its latest HTTP attempt."""
+    hooks = HttpHooks()
+    request_id = hooks._start_request()
+    headers = ResponseHeaders()
+
+    with (
+        track_response_headers(headers),
+        patch("inspect_ai.model._providers.util.hooks.report_http_retry"),
+    ):
+        hooks.update_request_time(request_id)
+        hooks.record_response(request_id, 503, {"X-First": "a"})
+        hooks.update_request_time(request_id)
+        hooks.record_response(request_id, 200, {"X-Second": "b"})
+
+    assert headers.latest == {"x-second": "b"}
+    # a response outside a tracked model call is not kept
+    hooks.record_response(request_id, 200, {"x-third": "c"})
+    assert headers.latest == {"x-second": "b"}
+
+
+def test_provider_can_record_its_own_response_headers():
+    """A provider without the HTTP hooks records headers through the public function."""
+    headers = ResponseHeaders()
+
+    with track_response_headers(headers):
+        record_response_headers({"X-From-My-Sdk": "a"})
+
+    assert headers.latest == {"x-from-my-sdk": "a"}
