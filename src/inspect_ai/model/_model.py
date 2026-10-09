@@ -41,6 +41,7 @@ from tenacity import (
 )
 from tenacity.wait import WaitBaseT
 
+from inspect_ai._sentinel._header import SentinelRejectedError, sentinel_error
 from inspect_ai._util.constants import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_BATCH,
@@ -1606,6 +1607,8 @@ class Model:
                     # belongs to the failed attempt)
                     stream_observer.discard_partial_output()
                     complete(ex, None)
+                    if decided := sentinel_error(response_headers.latest, ex):
+                        raise decided from ex
                     raise
                 except anyio.get_cancelled_exc_class():
                     # Cancellation is a BaseException, so the handler above
@@ -1638,6 +1641,13 @@ class Model:
             else:
                 output = result
                 call = None
+
+            # a sentinel's decision comes first, even if the provider turned
+            # the error into output
+            if decided := sentinel_error(response_headers.latest, output):
+                stream_observer.discard_partial_output()
+                complete(decided, call)
+                raise decided
 
             # raise error
             if isinstance(output, Exception):
@@ -1781,6 +1791,12 @@ class Model:
             # controller doesn't scale down for what's essentially infra
             # noise (a stalled connection included).
             if isinstance(ex, (AttemptTimeoutError, StreamIdleTimeoutError)):
+                report_http_retry(model=model)
+                return True
+
+            # a sentinel rejected the reply: the model is asked again, and is
+            # told of the rejection in the request the sentinel then sends on
+            if isinstance(ex, SentinelRejectedError):
                 report_http_retry(model=model)
                 return True
 
