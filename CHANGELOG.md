@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Model API: Inspect keeps the response headers of each model call attempt for the model layer to read. Providers that make their own HTTP calls record them with `record_response_headers()` (experimental).
 - Tasks and samples can carry a `description` of what they ask of the agent, recorded in the eval log and in `evals_df()` and `samples_df()`.
 - Tool review now also reviews `handoff()` calls, as approval does.
 - Compaction: Fixed compaction triggering early and reporting inflated token counts on OpenAI reasoning models, which counted replayed reasoning twice.
