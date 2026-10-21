@@ -153,6 +153,7 @@ jobs:
     outputs:
       sandbox_tools: ${{ steps.areas.outputs.sandbox_tools }}
       docs: ${{ steps.areas.outputs.docs }}
+      anthropic: ${{ steps.areas.outputs.anthropic }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -164,6 +165,16 @@ jobs:
             docs:
               - 'docs/**'
               - 'requirements-doc.txt'
+            anthropic:
+              - 'src/inspect_ai/**/*anthropic*'
+              - 'src/inspect_ai/agent/_bridge/**'
+              - 'src/inspect_ai/model/_providers/providers.py'
+              - 'tests/**/*anthropic*'
+              - 'tests/agent/test_bridge_headers.py'
+              - 'tests/model/test_token_refresh.py'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/workflows/build.yml'
 
   # Validate the Quarto docs site whenever docs change — on docs-only PRs
   # (where the test matrix is skipped) and on mixed docs+code PRs alike.
@@ -362,6 +373,48 @@ jobs:
 
       - name: Minimize uv cache
         if: ${{ !cancelled() && env.RUN_TESTS == 'true' }}
+        run: uv cache prune --ci
+
+  # The test job runs against the lockfile's anthropic 2.x; this runs the
+  # Anthropic tests again on the oldest supported 1.x (MIN_VERSION in
+  # providers.py), which sends an older API version and takes the sampling
+  # parameters 2.x drops.
+  test-anthropic-1x:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.anthropic == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          filter: "blob:none"
+          submodules: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |-
+          uv sync
+          uv pip install --no-deps ./tests/test_package
+          uv pip install "anthropic==1.8.0"
+
+      - name: Test with pytest
+        run: >-
+          uv run --no-sync pytest -ra --color=yes -n logical --timeout=900 --timeout-method=thread
+          tests/model/providers/test_anthropic*.py
+          tests/model/test_anthropic_convert.py
+          tests/agent/test_bridge_headers.py
+          tests/model/test_token_refresh.py
+
+      - name: Minimize uv cache
+        if: ${{ !cancelled() }}
         run: uv cache prune --ci
 
   # Tests for the injected sandbox-tools package. These live under
