@@ -1,7 +1,6 @@
 """Tests for Anthropic model API conversion functions."""
 
 from anthropic.types import (
-    AssistantMessageParam,
     CitationsConfigParam,
     DocumentBlockParam,
     Message,
@@ -12,7 +11,6 @@ from anthropic.types import (
     ToolResultBlockParam,
     ToolUseBlock,
     Usage,
-    UserMessageParam,
 )
 
 from inspect_ai._util.content import ContentDocument, ContentReasoning, ContentText
@@ -105,9 +103,9 @@ def test_normalize_document_citations_enables_all_history_documents() -> None:
         citations=CitationsConfigParam(enabled=True),
     )
     messages: list[MessageParam] = [
-        UserMessageParam(role="user", content=[first_document]),
-        AssistantMessageParam(role="assistant", content="Acknowledged."),
-        UserMessageParam(role="user", content=[last_document]),
+        {"role": "user", "content": [first_document]},
+        {"role": "assistant", "content": "Acknowledged."},
+        {"role": "user", "content": [last_document]},
     ]
 
     normalize_document_citations(messages)
@@ -132,8 +130,8 @@ def test_normalize_document_citations_enables_tool_result_documents() -> None:
         content=[tool_document],
     )
     messages: list[MessageParam] = [
-        UserMessageParam(role="user", content=[history_document]),
-        UserMessageParam(role="user", content=[tool_result]),
+        {"role": "user", "content": [history_document]},
+        {"role": "user", "content": [tool_result]},
     ]
 
     normalize_document_citations(messages)

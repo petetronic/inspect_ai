@@ -395,8 +395,9 @@ def validate_openai_client(feature: str) -> None:
 
 def validate_anthropic_client(feature: str) -> None:
     PACKAGE = "anthropic"
-    # 2.0.0 split MessageParam into role-specific types — inspect requires it
-    MIN_VERSION = "2.0.0"
+    # 1.8.0 prepares the request body inside request(), which the agent bridge
+    # relies on; 2.x is supported too
+    MIN_VERSION = "1.8.0"
 
     # verify we have the package
     try:

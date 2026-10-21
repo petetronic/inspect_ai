@@ -33,6 +33,7 @@ from inspect_ai.agent._bridge.sandbox.service import (
 from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
 from inspect_ai.agent._bridge.util import merge_extra_headers
 from inspect_ai.model import GenerateConfig, get_model
+from inspect_ai.model._providers.anthropic import ANTHROPIC_2
 from inspect_ai.tool._tools._code_execution import CodeExecutionProviders
 from inspect_ai.tool._tools._web_search._web_search import WebSearchProviders
 
@@ -714,8 +715,13 @@ class TestSandboxAnthropicRequest:
         [request] = provider_requests
         assert request.headers["anthropic-beta"] == "allowed-beta-2026-01-01"
         assert request.headers["accept-encoding"] == "br"
-        assert request.headers.get_list("authorization") == ["Bearer test-key"]
-        assert "x-api-key" not in request.headers
+        # anthropic 2.0 sends the key as a bearer token, and 1.x as x-api-key
+        if ANTHROPIC_2:
+            assert request.headers.get_list("authorization") == ["Bearer test-key"]
+            assert "x-api-key" not in request.headers
+        else:
+            assert request.headers["x-api-key"] == "test-key"
+            assert "authorization" not in request.headers
         assert any("unlisted-beta-2026-01-01" in m for m in _logged_drops())
 
     @pytest.mark.anyio
@@ -1089,4 +1095,9 @@ class TestSandboxRoutesKeepHostCredentials:
             await model.api.aclose()
 
         [request] = requests
-        self._assert_host_credentials(request, {"authorization": "Bearer host-key"})
+        self._assert_host_credentials(
+            request,
+            {"authorization": "Bearer host-key"}
+            if ANTHROPIC_2
+            else {"x-api-key": "host-key"},
+        )

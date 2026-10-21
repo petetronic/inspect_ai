@@ -8,6 +8,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from logging import getLogger
 from typing import (
+    TYPE_CHECKING,
     Any,
     Collection,
     Iterable,
@@ -33,9 +34,9 @@ from anthropic import (
     BadRequestError,
     NotGiven,
 )
+from anthropic import __version__ as anthropic_version
 from anthropic.lib.streaming import AsyncMessageStream
 from anthropic.types import (
-    AssistantMessageParam,
     Base64PDFSourceParam,
     BrowserStateBlockParam,
     CacheControlEphemeralParam,
@@ -49,7 +50,6 @@ from anthropic.types import (
     DocumentBlockParam,
     ImageBlockParam,
     Message,
-    MessageContentParam,
     MessageParam,
     OutputConfigParam,
     PlainTextSourceParam,
@@ -57,7 +57,6 @@ from anthropic.types import (
     RedactedThinkingBlockParam,
     ServerToolUseBlock,
     ServerToolUseBlockParam,
-    SystemMessageParam,
     TextBlock,
     TextBlockParam,
     ThinkingBlock,
@@ -73,7 +72,6 @@ from anthropic.types import (
     ToolTextEditor20250124Param,
     ToolUseBlock,
     ToolUseBlockParam,
-    UserMessageParam,
     WebSearchResultBlock,
     WebSearchTool20250305Param,
     WebSearchTool20260209Param,
@@ -243,6 +241,29 @@ from .util import (
 )
 from .util.hooks import HttpxHooks
 
+if TYPE_CHECKING:
+    from anthropic.types import (
+        AssistantMessageParam,
+        MessageContentParam,
+        SystemMessageParam,
+        UserMessageParam,
+    )
+else:
+    try:
+        from anthropic.types import (
+            AssistantMessageParam,
+            MessageContentParam,
+            SystemMessageParam,
+            UserMessageParam,
+        )
+    except ImportError:
+        # anthropic 1.x has one MessageParam for every role
+        AssistantMessageParam = SystemMessageParam = UserMessageParam = MessageParam
+        MessageContentParam = Any
+
+# anthropic 2.0 sends API version 2026-10-21, which changes what requests take
+ANTHROPIC_2 = int(anthropic_version.split(".")[0]) >= 2
+
 logger = getLogger(__name__)
 
 ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"
@@ -251,6 +272,14 @@ AZUREAI_ANTHROPIC_API_KEY = "AZUREAI_ANTHROPIC_API_KEY"
 _SAMPLING_PARAM_WARNING = (
     "anthropic models do not support the '{parameter}' parameter "
     "(removed in API version 2026-10-21)."
+)
+_THINKING_WARNING = (
+    "anthropic models do not support the '{parameter}' parameter "
+    "when using extended thinking."
+)
+_ADAPTIVE_ONLY_WARNING = (
+    "anthropic model '{model}' does not support the '{parameter}' parameter "
+    "(adaptive thinking only)."
 )
 _REASONING_TOKENS_UNSUPPORTED_ERROR = (
     "anthropic model '{model}' does not support 'reasoning_tokens' (extended "
@@ -1427,19 +1456,41 @@ class AnthropicAPI(ModelAPI):
         # request body, which Bedrock rejects for some models (Sonnet 4.6);
         # send the version anthropic 1.x sent
         extra_body: dict[str, Any] = (
-            {"anthropic_version": "bedrock-2023-05-31"} if self.is_bedrock() else {}
+            {"anthropic_version": "bedrock-2023-05-31"}
+            if self.is_bedrock() and ANTHROPIC_2
+            else {}
         )
         betas: list[str] = self.betas + self._pull_betas_from_headers(headers)
 
         # API version 2026-10-21 (anthropic >= 2.0) rejects these params on
-        # every model
+        # every model. Under anthropic 1.x, Claude 4.7+ is always in adaptive
+        # thinking and rejects them, and other models reject them only under
+        # thinking.
+        def sampling_param_warning(parameter: str) -> str | None:
+            if ANTHROPIC_2:
+                return _SAMPLING_PARAM_WARNING.format(parameter=parameter)
+            if self.is_claude_4_7_or_later():
+                return _ADAPTIVE_ONLY_WARNING.format(
+                    parameter=parameter, model=self.service_model_name()
+                )
+            if self.is_using_thinking(config):
+                return _THINKING_WARNING.format(parameter=parameter)
+            return None
+
+        # anthropic >= 1.0 removed temperature/top_p/top_k from the method
+        # signatures (the API still accepts them for models that support
+        # them), so route via extra_body rather than params
         for parameter, value in (
             ("temperature", config.temperature),
             ("top_p", config.top_p),
             ("top_k", config.top_k),
         ):
             if value is not None:
-                warn_once(logger, _SAMPLING_PARAM_WARNING.format(parameter=parameter))
+                warning = sampling_param_warning(parameter)
+                if warning is not None:
+                    warn_once(logger, warning)
+                else:
+                    extra_body[parameter] = value
 
         # effort
         if config.effort is not None:

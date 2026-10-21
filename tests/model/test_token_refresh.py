@@ -34,7 +34,7 @@ from inspect_ai.model import (
     get_model,
 )
 from inspect_ai.model._model_info import _get_model_info_direct
-from inspect_ai.model._providers.anthropic import AnthropicAPI
+from inspect_ai.model._providers.anthropic import ANTHROPIC_2, AnthropicAPI
 from inspect_ai.model._providers.grok import GrokAPI
 from inspect_ai.model._providers.groq import GroqAPI
 from inspect_ai.model._providers.openai import OpenAIAPI
@@ -208,7 +208,13 @@ _ANTHROPIC_MESSAGE = {
             "https://example.com/v1",
             "authorization",
         ),
-        (AnthropicAPI, "claude-sonnet-4-6", "https://example.com", "authorization"),
+        (
+            AnthropicAPI,
+            "claude-sonnet-4-6",
+            "https://example.com",
+            # anthropic 2.0 sends the key as a bearer token, and 1.x as x-api-key
+            "authorization" if ANTHROPIC_2 else "x-api-key",
+        ),
         (
             AnthropicAPI,
             "azure/claude-sonnet-4-6",

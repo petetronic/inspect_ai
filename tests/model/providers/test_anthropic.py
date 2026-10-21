@@ -29,7 +29,7 @@ from inspect_ai.model import (
     GenerateConfig,
     get_model,
 )
-from inspect_ai.model._providers.anthropic import AnthropicAPI
+from inspect_ai.model._providers.anthropic import ANTHROPIC_2, AnthropicAPI
 from inspect_ai.tool import ToolCall, ToolFunction, ToolInfo
 
 
@@ -1406,7 +1406,7 @@ async def test_anthropic_top_level_cache_control_skipped_on_bedrock_vertex(
 async def test_anthropic_bedrock_api_version(
     model_name: str, anthropic_version: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Bedrock requests carry the Bedrock `anthropic_version` in the body."""
+    """Under anthropic 2.0, Bedrock requests carry the Bedrock `anthropic_version` in the body; 1.x already sends it."""
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "fake")
     monkeypatch.setenv("ANTHROPIC_VERTEX_REGION", "us-east5")
@@ -1414,7 +1414,9 @@ async def test_anthropic_bedrock_api_version(
     api = AnthropicAPI(model_name=model_name, api_key="test-key")
     _, extra_body, _, _ = api.completion_config(GenerateConfig(max_tokens=16))
 
-    assert extra_body.get("anthropic_version") == anthropic_version
+    assert extra_body.get("anthropic_version") == (
+        anthropic_version if ANTHROPIC_2 else None
+    )
 
 
 @pytest.mark.anyio
@@ -1548,13 +1550,15 @@ def _cfg(**kwargs: Any) -> GenerateConfig:
 def test_anthropic_strips_sampling_params(
     model_name: str, reasoning_effort: str | None, param: str, value: float | int
 ) -> None:
-    """API version 2026-10-21 rejects temperature/top_p/top_k on every model."""
+    """API version 2026-10-21 (anthropic 2.0) rejects temperature/top_p/top_k on every model; under anthropic 1.x only Claude 4.7+ and thinking reject them."""
     api = AnthropicAPI(model_name=model_name, api_key="test-key")
-    params, extra_body, _headers, _betas = api.completion_config(
-        _cfg(reasoning_effort=reasoning_effort, **{param: value})
-    )
+    config = _cfg(reasoning_effort=reasoning_effort, **{param: value})
+    params, extra_body, _headers, _betas = api.completion_config(config)
     assert param not in params
-    assert param not in extra_body
+    if ANTHROPIC_2 or api.is_claude_4_7_or_later() or api.is_using_thinking(config):
+        assert param not in extra_body
+    else:
+        assert extra_body[param] == value
 
 
 @pytest.mark.anyio
@@ -1703,10 +1707,19 @@ def test_anthropic_sampling_param_warning(
 ) -> None:
     api = AnthropicAPI(model_name=model_name, api_key="test-key")
     api.completion_config(_cfg(temperature=0.0))
-    assert any(
-        "'temperature'" in m and "API version 2026-10-21" in m
-        for m in _warn_once_messages
-    )
+    if ANTHROPIC_2:
+        assert any(
+            "'temperature'" in m and "API version 2026-10-21" in m
+            for m in _warn_once_messages
+        )
+    elif api.is_claude_4_7_or_later():
+        assert any(
+            "'temperature'" in m and "adaptive thinking only" in m
+            for m in _warn_once_messages
+        )
+    else:
+        # anthropic 1.x sends temperature to a model that takes it
+        assert not _warn_once_messages
 
 
 # ---------------------------------------------------------------------------
