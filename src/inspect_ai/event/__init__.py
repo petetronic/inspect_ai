@@ -17,7 +17,12 @@ from ._sample_limit import SampleLimitEvent
 from ._sandbox import SandboxEvent
 from ._score import ScoreEvent
 from ._score_edit import ScoreEditEvent
-from ._sentinel import SentinelAction, SentinelEvent, SentinelSuspicion
+from ._sentinel import (
+    SentinelAction,
+    SentinelEvent,
+    SentinelSidecar,
+    SentinelSuspicion,
+)
 from ._span import SpanBeginEvent, SpanEndEvent
 from ._state import StateEvent
 from ._step import StepEvent
@@ -50,6 +55,7 @@ __all__ = [
     "ApprovalEvent",
     "ReviewEvent",
     "SentinelEvent",
+    "SentinelSidecar",
     "SentinelAction",
     "SentinelSuspicion",
     "AnchorEvent",
