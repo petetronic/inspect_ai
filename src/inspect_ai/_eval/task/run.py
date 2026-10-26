@@ -3080,7 +3080,6 @@ async def _task_run_sample_attempt(
 
                     # scoring
                     with anyio.CancelScope(shield=cancelled_error is not None):
-                        await copy_sidecar_monitor_state(state)
                         await emit_sample_scoring(
                             eval_set_id,
                             run_id,
@@ -3097,6 +3096,7 @@ async def _task_run_sample_attempt(
                                     and attempt.retries_remaining == 0
                                     and cancelled_error is None
                                 ):
+                                    await copy_sidecar_monitor_state(state)
                                     async with span(name="scorers"):
                                         for scorer_idx, scorer in enumerate(
                                             scorers or []

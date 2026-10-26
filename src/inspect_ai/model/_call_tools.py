@@ -844,6 +844,16 @@ async def call_tool(
         await record_pending_tool_event()
         raise ToolApprovalError(decided.message)
 
+    # A call the sidecar changed is the call Inspect is handed, so approvers
+    # and an in-process sentinel see it changed and may change it again.
+    if decided is not None and decided.modified is not None:
+        error = _sidecar_modified_error(shown, decided.modified)
+        if error is not None:
+            await record_pending_tool_event()
+            raise RuntimeError(error)
+        call, arguments = await revalidated_tool_call(decided.modified, tool_def)
+        shown = shown_to_callbacks(call)
+
     # if we have a tool approver, apply it now
     from inspect_ai.approval._apply import (
         apply_tool_approval,
@@ -876,15 +886,6 @@ async def call_tool(
     elif approval is not None and _changed_in_place(call, shown):
         await record_pending_tool_event()
         raise ToolApprovalError(_CHANGED_IN_PLACE)
-
-    # where an in-process sentinel's modify applies, after the approvers
-    if decided is not None and decided.modified is not None:
-        error = _sidecar_modified_error(shown, decided.modified)
-        if error is not None:
-            await record_pending_tool_event()
-            raise RuntimeError(error)
-        call, arguments = await revalidated_tool_call(decided.modified, tool_def)
-        shown = shown_to_callbacks(call)
 
     if checks_tool_calls():
         from inspect_ai._sentinel._dispatch import (

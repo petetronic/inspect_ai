@@ -47,6 +47,7 @@ from inspect_ai._sentinel._context import is_agent_generate
 from inspect_ai._sentinel._sidecar._act import (
     act_on_field,
     end_if_terminated,
+    refusal_after_error,
     refused_output,
 )
 from inspect_ai._sentinel._sidecar._field import (
@@ -57,7 +58,6 @@ from inspect_ai._sentinel._sidecar._field import (
 )
 from inspect_ai._sentinel._sidecar._lookup import (
     request_result,
-    unjudged_error,
     unjudged_reply,
 )
 from inspect_ai._util.constants import (
@@ -1082,9 +1082,16 @@ class Model:
                         on_stream=on_stream,
                     )
                 except Exception as ex:
-                    if receiving is not None:
-                        unjudged_error(receiving.looked, ex)
-                    raise
+                    if receiving is None:
+                        raise
+                    # an error Inspect stopped retrying may still have been
+                    # a refusal for a sidecar's decision
+                    recovered = await refusal_after_error(
+                        receiving, str(self), ex, _bridged()
+                    )
+                    if recovered is None:
+                        raise
+                    output, event = recovered, None
                 field = received_field()
 
             # update the most recent ModelEvent with the actual start/completed
@@ -1095,20 +1102,24 @@ class Model:
             from inspect_ai.event._model import ModelEvent
             from inspect_ai.log._transcript import transcript
 
-            assert isinstance(event, ModelEvent)
-            event.timestamp = start_time
-            event.working_start = working_start
-            completed = datetime.now(timezone.utc)
-            event.completed = completed
-            event.working_time = (
-                output.time
-                if output.time is not None
-                else (completed - start_time).total_seconds()
-            )
+            # a refusal recovered after the error has no event of its own: the
+            # call's event records the error
+            if event is not None:
+                assert isinstance(event, ModelEvent)
+                event.timestamp = start_time
+                event.working_start = working_start
+                completed = datetime.now(timezone.utc)
+                event.completed = completed
+                event.working_time = (
+                    output.time
+                    if output.time is not None
+                    else (completed - start_time).total_seconds()
+                )
 
-            # re-emit so subscribers (e.g. the sample buffer, which serializes a
-            # snapshot at emission time) pick up the timing fields set above
-            transcript()._event_updated(event)
+                # re-emit so subscribers (e.g. the sample buffer, which
+                # serializes a snapshot at emission time) pick up the timing
+                # fields set above
+                transcript()._event_updated(event)
 
             # fail the sample on a refusal if requested. Raised here, after the
             # ModelEvent is complete (so the transcript shows the refusal and
@@ -1132,9 +1143,8 @@ class Model:
         # proxy did
         if field is not None and through_sidecar is not None:
             from inspect_ai._sentinel._sidecar._events import record_sidecar_reports
-            from inspect_ai.agent._bridge.util import in_bridge_model_generate
 
-            output = act_on_field(field, output, in_bridge_model_generate())
+            output = act_on_field(field, output, _bridged())
             record_sidecar_reports(
                 field,
                 through_sidecar.sidecar,
@@ -1708,7 +1718,7 @@ class Model:
                     # a sidecar's refusal of an agent call is acted on as the
                     # model's turn, as an in-process sentinel's decision is
                     refused = await refused_output(
-                        str(self), _would_retry(self.api, ex)
+                        str(self), _would_retry(self.api, ex), _bridged()
                     )
                     if refused is None:
                         # Mark event as failed for uncaught provider exceptions
@@ -1754,7 +1764,7 @@ class Model:
 
             if isinstance(output, Exception):
                 refused = await refused_output(
-                    str(self), _would_retry(self.api, output)
+                    str(self), _would_retry(self.api, output), _bridged()
                 )
                 if refused is not None:
                     stream_observer.discard_partial_output()
@@ -2358,6 +2368,13 @@ def _model_refusal_message(
     if len(completion) > max_completion:
         completion = completion[:max_completion].rstrip() + "..."
     return f"Model refusal ({', '.join(details)}): {completion}"
+
+
+def _bridged() -> bool:
+    """Whether the current model call is a bridged agent's, which runs its own tools."""
+    from inspect_ai.agent._bridge.util import in_bridge_model_generate
+
+    return in_bridge_model_generate()
 
 
 def _would_retry(api: ModelAPI, ex: BaseException) -> bool:
