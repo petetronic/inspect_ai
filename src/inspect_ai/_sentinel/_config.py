@@ -1,6 +1,6 @@
 import importlib
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, Union, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeAlias, Union, cast
 
 import yaml
 from pydantic import (
@@ -24,6 +24,13 @@ if TYPE_CHECKING:
     from inspect_sentinel._integration import Sentinels
 else:
     Sentinels: TypeAlias = Any
+
+
+SentinelProxy: TypeAlias = Literal["auto", "required", "off"]
+"""Whether Inspect looks for a sentinel sidecar behind a model's proxy, and whether it must find one.
+
+Experimental: not yet a stable API; may change without notice.
+"""
 
 
 class SentinelEntry(BaseModel):
