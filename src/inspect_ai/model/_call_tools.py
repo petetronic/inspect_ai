@@ -834,6 +834,16 @@ async def call_tool(
     # without oversight the event records the model's arguments, as on main
     shown = shown_to_callbacks(call if overseen else model_call)
 
+    # A call a sentinel sidecar rejected is answered as an in-process
+    # sentinel's rejection is. No approver sees it: the sidecar judged the
+    # turn before Inspect was handed it.
+    from inspect_ai._sentinel._sidecar._act import take_call_decision
+
+    decided = take_call_decision(call.id)
+    if decided is not None and decided.action == "reject":
+        await record_pending_tool_event()
+        raise ToolApprovalError(decided.message)
+
     # if we have a tool approver, apply it now
     from inspect_ai.approval._apply import (
         apply_tool_approval,
@@ -866,6 +876,15 @@ async def call_tool(
     elif approval is not None and _changed_in_place(call, shown):
         await record_pending_tool_event()
         raise ToolApprovalError(_CHANGED_IN_PLACE)
+
+    # where an in-process sentinel's modify applies, after the approvers
+    if decided is not None and decided.modified is not None:
+        error = _sidecar_modified_error(shown, decided.modified)
+        if error is not None:
+            await record_pending_tool_event()
+            raise RuntimeError(error)
+        call, arguments = await revalidated_tool_call(decided.modified, tool_def)
+        shown = shown_to_callbacks(call)
 
     if checks_tool_calls():
         from inspect_ai._sentinel._dispatch import (
@@ -945,6 +964,12 @@ _SENTINEL_MODIFIED_FUNCTION = (
     "'modify' decision may change only the arguments of a tool call, not the "
     "function called."
 )
+
+
+def _sidecar_modified_error(shown: ToolCall, modified: ToolCall) -> str | None:
+    if modified.function != shown.function:
+        return _SENTINEL_MODIFIED_FUNCTION.format(modified.function, shown.function)
+    return _modified_id_error("A sentinel sidecar", shown, modified)
 
 
 def _modified_id_error(who: str, shown: ToolCall, modified: ToolCall) -> str | None:
