@@ -1,4 +1,4 @@
-"""Human review of a tool call or a model's turn, asked for by a sentinel in a sidecar.
+"""Human review of a tool call, a model's turn or a model's request, asked for by a sentinel in a sidecar.
 
 A person may take days to answer, so the sidecar holds no connection open
 while it waits. It answers the model request at once with an error, and keeps
@@ -27,7 +27,7 @@ from logging import getLogger
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 
 import anyio
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai._util.http import status_code_of
@@ -39,10 +39,12 @@ from inspect_ai.model._chat_message import (
     ChatMessageTool,
 )
 from inspect_ai.tool._tool_call import ToolCall, ToolCallView
+from inspect_ai.tool._tool_choice import ToolChoice, ToolFunction
 from inspect_ai.util._limit import LimitExceededError
 
 from .._person import (
     HUMAN_CHOICES,
+    ask_about_request,
     ask_about_turn,
     chosen_decision,
     escalation_lines,
@@ -720,6 +722,8 @@ _ABOUT_A_CALL = "the call to a tool"
 
 def _asked_about(question: dict[str, Any]) -> str:
     # what the question is about, in words for a warning
+    if question.get("stage") == _REQUEST_STAGE:
+        return "the model's request"
     if question.get("stage") == _TURN_STAGE:
         return "the model's turn"
     call = question.get("call")
@@ -729,6 +733,47 @@ def _asked_about(question: dict[str, Any]) -> str:
 
 _TURN_STAGE = "model_output"
 """The stage of a question about a model's whole turn, asked after a generate."""
+
+_REQUEST_STAGE = "model_input"
+"""The stage of a question about the request a model is about to be sent, asked before a generate."""
+
+
+class _MessageShown(BaseModel):
+    # one message of a request that the model has not been sent before
+    position: int
+    message: ChatMessage
+
+
+class _RequestShown(BaseModel):
+    # the request that a question before a generate is about, as the sidecar
+    # writes it
+    model: str
+    messages: int
+    new: list[_MessageShown]
+    tools: list[str]
+    tool_choice: Literal["auto", "any", "none", "function"]
+    tool_function: str | None = None
+
+    def shown(
+        self,
+    ) -> tuple[str, int, list[tuple[int, ChatMessage]], list[str], ToolChoice]:
+        choice: ToolChoice
+        if self.tool_choice != "function":
+            choice = self.tool_choice
+        elif self.tool_function is not None:
+            choice = ToolFunction(name=self.tool_function)
+        else:
+            raise ValueError("The request names no function the model must call.")
+        return (
+            self.model,
+            self.messages,
+            [(shown.position, shown.message) for shown in self.new],
+            self.tools,
+            choice,
+        )
+
+
+_REQUEST = TypeAdapter(_RequestShown)
 
 
 async def _show_question(
@@ -744,6 +789,16 @@ async def _show_question(
         if isinstance(escalation, dict)
     ]
     approve = human_approver(choices=offered)
+    if question.get("stage") == _REQUEST_STAGE:
+        approval = await ask_about_request(
+            approve,
+            *_REQUEST.validate_python(question.get("request")).shown(),
+            escalations,
+            offered,
+            # Inspect's own copy of the conversation, as below
+            history,
+        )
+        return chosen_decision(approval, offered)
     if question.get("stage") == _TURN_STAGE:
         turn = question.get("turn")
         approval = await ask_about_turn(
