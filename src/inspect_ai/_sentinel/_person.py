@@ -2,18 +2,20 @@
 
 A sentinel in the eval's own process asks through `human()`. A sentinel in a
 sidecar asks through the sidecar's questions. Both show a call, a turn or a
-request the same way and read the person's choice the same way, so what the
-person sees doesn't depend on where the sentinel runs.
+request the same way and read the person's choice the same way. One thing
+differs: a sidecar holds the model's reply while it asks about it, so Inspect
+has shown the person none of the turn, and the question's view holds what the
+turn says and reasons too (see `_turn_content`).
 """
 
 import re
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Literal, NamedTuple, cast
 
 from shortuuid import uuid as shortuuid
 
-from inspect_ai._util.content import ContentReasoning
+from inspect_ai._util.content import ContentReasoning, ContentText, ContentToolUse
 from inspect_ai._util.format import MARKER_CLOSE, MARKER_OPEN, display_safe
 from inspect_ai.approval._approval import Approval, ApprovalDecision
 from inspect_ai.approval._approver import Approver
@@ -35,6 +37,7 @@ from inspect_ai.tool._tool_call import (
     substitute_tool_call_content,
 )
 from inspect_ai.tool._tool_choice import ToolChoice, ToolFunction
+from inspect_ai.util._notify import apprise_scope, notify
 
 HUMAN_CHOICES = ("approve", "reject", "terminate")
 """The choices a person can be offered.
@@ -109,6 +112,59 @@ def human_view(
     if result is not None:
         view = view_with_result(view, result)
     return view
+
+
+def held_call_view(
+    view: ToolCallView,
+    call: ToolCall,
+    escalated: str | None,
+    turn: ChatMessageAssistant,
+) -> ToolCallView:
+    """Build the view of a call whose turn the person has seen none of.
+
+    A sidecar holds the reply that makes the call while it asks, so the view
+    shows what the turn holds besides its tool calls, between the escalations
+    and the call (see `_turn_content`).
+
+    The view is markdown, and everything in it but its labels is inside a code
+    block it cannot close: what the turn holds, and what the tool's viewer
+    made of the call and of its context, with the call's arguments filled in
+    first (see `_contained`). So nothing an agent wrote passes for one of the
+    view's labels. A viewer's plain text is in a code block too, because the
+    surfaces wrap plain text to the window, and a wrapped line starts at the
+    margin as a label does.
+
+    Args:
+        view: The call's own view.
+        call: The call.
+        escalated: The escalations, as `escalation_lines` writes them, or None
+            if there are none.
+        turn: The turn that made the call.
+    """
+    escaped = _Escaped()
+
+    def safe(text: str) -> str:
+        # The surfaces fill in the call's arguments again, after any fence
+        # here is sized. So nothing here may still read as a placeholder.
+        return escape_placeholders(escaped(text))
+
+    shown = [f"**Escalated by**\n\n{fenced(safe(escalated))}"] if escalated else []
+    shown.extend(section.markdown() for section in _turn_content(turn, safe))
+    title: str | None = None
+    made: list[str] = []
+    for label, part in (("The call's context", view.context), ("The call", view.call)):
+        if part is not None:
+            filled = substitute_tool_call_content(part, call.arguments)
+            made.append(f"**{label}**\n\n{_contained(filled, safe)}")
+            if part is view.call and filled.title:
+                title = " ".join(safe(filled.title).split())
+    if escaped.escaped:
+        shown.append(f"**{_ESCAPED_NOTICE}**")
+    return ToolCallView(
+        call=ToolCallContent(
+            title=title, format="markdown", content="\n\n".join([*shown, *made])
+        )
+    )
 
 
 def chosen_decision(
@@ -197,6 +253,8 @@ class Prompt(NamedTuple):
     message: str
     call: ToolCall
     view: ToolCallView
+    said: str | None = None
+    """The turn's text, when the view holds it and `message` is empty. None when `message` carries it, or there is none."""
 
 
 async def _ask_with(
@@ -211,7 +269,14 @@ async def _ask_with(
 
     status: Literal["completed", "failed"] = "failed"
     try:
-        approval = await approve(prompt.message, prompt.call, prompt.view, conversation)
+        if prompt.said is not None:
+            approval = await approve_with_text_in_view(
+                approve, prompt.said, prompt.call, prompt.view, conversation
+            )
+        else:
+            approval = await approve(
+                prompt.message, prompt.call, prompt.view, conversation
+            )
         if approval.decision in offered:
             status = "completed"
         return approval
@@ -341,14 +406,14 @@ def _message_markdown(
     shown_types = {"text"}
     if isinstance(message, ChatMessageAssistant):
         shown_types.add("reasoning")
-        readable, withheld = _reasoning(message)
-        if readable:
-            thought = safe("\n\n".join(readable))
+        reasoned = _reasoning(message)
+        if reasoned.readable:
+            thought = safe("\n\n".join(reasoned.readable))
             parts.append(f"**Its reasoning**\n\n{_code_block(thought, '')}")
-        if withheld:
+        if reasoned.withheld:
             parts.append(
-                f"**The provider withheld the text of {withheld} "
-                f"{'block' if withheld == 1 else 'blocks'} of its reasoning.**"
+                f"**The provider withheld the text of {reasoned.withheld} "
+                f"{'block' if reasoned.withheld == 1 else 'blocks'} of its reasoning.**"
             )
     parts.append(_code_block(safe(text), ""))
     calls = (
@@ -372,6 +437,32 @@ def _message_markdown(
             f"{'is' if other == 1 else 'are'} not text, and not shown.**"
         )
     return "\n\n".join(parts)
+
+
+async def approve_with_text_in_view(
+    approve: Approver,
+    said: str,
+    call: ToolCall,
+    view: ToolCallView,
+    conversation: list[ChatMessage],
+) -> Approval:
+    """Ask a person with a view that already holds the turn's text.
+
+    The prompt's message is empty, so that no surface shows the text twice.
+    The human approver notifies the operator with the message, so the text is
+    sent from here instead and the approver's own notification is turned off:
+    the operator is told what a turn that reached Inspect would have told them.
+
+    Args:
+        approve: The human approver to ask with.
+        said: The turn's text, for the notification.
+        call: The call to ask about.
+        view: The view, which holds the text.
+        conversation: The conversation to show beside the prompt.
+    """
+    await notify(said)
+    with apprise_scope(None):
+        return await approve("", call, view, conversation)
 
 
 def turn_prompt(
@@ -408,12 +499,11 @@ def turn_prompt(
     own, unlike any tool call's or another prompt's, since an ACP client opens
     a card under it; its empty arguments leave the view as rendered here.
 
-    With `content_in_view`, the turn's reasoning and text go into the view,
-    above the count, and the prompt's message is empty. A sentinel in a sidecar
-    asks before the turn reaches Inspect, so none of it has streamed to the
-    person: an ACP client shows no message of its own, and no surface has shown
-    the reasoning. Reasoning whose text the provider withheld is counted, so
-    the person knows there is some they can't read.
+    With `content_in_view`, what the turn holds besides its calls goes into
+    the view, above the count, and the prompt's message is empty (see
+    `_turn_content`). A sentinel in a sidecar asks before the turn reaches
+    Inspect, so none of it has streamed to the person: an ACP client shows no
+    message of its own, and no surface has shown the rest.
     """
     safe = _Escaped()
     message = turn
@@ -432,19 +522,8 @@ def turn_prompt(
     if escalations:
         escalated = safe(escalation_lines(escalations))
         blocks.append(f"**Escalated by**\n\n{fenced(escalated)}")
-    if content_in_view:
-        readable, withheld = _reasoning(message)
-        if readable:
-            thought = safe("\n\n".join(readable))
-            blocks.append(f"**The turn's reasoning**\n\n{_code_block(thought, '')}")
-        if withheld:
-            blocks.append(
-                f"**The provider withheld the text of {withheld} "
-                f"{'block' if withheld == 1 else 'blocks'} of the turn's reasoning.**"
-            )
-        if text:
-            blocks.append(f"**The turn says**\n\n{_code_block(text, '')}")
-        text = ""
+    if content_in_view and message is not None:
+        blocks.extend(section.markdown() for section in _turn_content(message, safe))
     count = f"**The turn makes {_calls(len(calls))}.**"
     if safe.escaped:
         count = f"{count}\n\n**{_ESCAPED_NOTICE}**"
@@ -459,25 +538,118 @@ def turn_prompt(
     view = ToolCallView(
         call=ToolCallContent(format="markdown", content="\n\n---\n\n".join(blocks))
     )
+    if content_in_view:
+        return Prompt("", stands_for_turn, view, text)
     return Prompt(text, stands_for_turn, view)
 
 
-def _reasoning(turn: ChatMessageAssistant | None) -> tuple[list[str], int]:
-    # The turn's reasoning a person can read, block by block, and how many
-    # blocks have none: a provider may return reasoning encrypted, with a
-    # summary or with nothing readable.
+class _Section(NamedTuple):
+    """One thing a view shows above a call: a label written here, then its content.
+
+    The content is shown inside a code block it cannot close, so nothing an
+    agent wrote adds structure to the view. A section with no content is a
+    notice.
+    """
+
+    label: str
+    """What the section is, in words written here."""
+
+    body: str | None = None
+    """The content, already made safe to display."""
+
+    name: str = ""
+    """Text an agent wrote that completes the label, such as a tool's name."""
+
+    def markdown(self) -> str:
+        head = f"**{self.label}**"
+        if self.name:
+            head = f"{head} {_markdown_escaped(self.name)}"
+        return head if self.body is None else f"{head}\n\n{fenced(self.body)}"
+
+
+class _Reasoning(NamedTuple):
+    """An assistant message's reasoning, as a person can read it."""
+
+    readable: list[str]
+    """The text of each block that has some."""
+
+    withheld: int
+    """How many blocks have no text a person can read."""
+
+
+def _reasoning(message: ChatMessageAssistant) -> _Reasoning:
+    # As the transcript shows it: a provider may return reasoning encrypted,
+    # with a summary, or with nothing readable.
     readable: list[str] = []
     withheld = 0
-    content = turn.content if turn is not None else ""
-    for block in content if isinstance(content, list) else []:
-        if not isinstance(block, ContentReasoning):
-            continue
-        thought = block.summary if block.redacted else block.reasoning
-        if thought:
-            readable.append(thought)
-        else:
-            withheld += 1
-    return readable, withheld
+    content = message.content if isinstance(message.content, list) else []
+    for block in content:
+        if isinstance(block, ContentReasoning):
+            thought = (
+                block.summary if block.redacted else (block.reasoning or block.summary)
+            )
+            if thought:
+                readable.append(thought)
+            else:
+                withheld += 1
+    return _Reasoning(readable, withheld)
+
+
+def _turn_content(
+    turn: ChatMessageAssistant, safe: Callable[[str], str]
+) -> list[_Section]:
+    """What a turn holds besides its tool calls, for a person who has seen none of it.
+
+    In order: the reasoning, the text, each tool the provider ran itself (a
+    web search, an MCP call, code execution) with its arguments and what it
+    returned, then a count of anything else, such as an image. Reasoning whose
+    text the provider withheld is counted too. So the person is shown, or
+    told of, everything in the turn.
+
+    Args:
+        turn: The assistant message of the turn.
+        safe: Makes text an agent wrote safe to display.
+    """
+    content = turn.content if isinstance(turn.content, list) else []
+    sections: list[_Section] = []
+    readable, withheld = _reasoning(turn)
+    if readable:
+        sections.append(_Section("The turn's reasoning", safe("\n\n".join(readable))))
+    if withheld:
+        sections.append(
+            _Section(
+                f"The provider withheld the text of {withheld} "
+                f"{'block' if withheld == 1 else 'blocks'} of the turn's reasoning."
+            )
+        )
+    if turn.text:
+        sections.append(_Section("The turn says", safe(turn.text)))
+    ran = [block for block in content if isinstance(block, ContentToolUse)]
+    for index, use in enumerate(ran, 1):
+        name = f"{use.name} ({use.tool_type}"
+        name += f", {use.context})" if use.context else ")"
+        sections.append(
+            _Section(
+                f"Tool {index} of {len(ran)} that the provider ran:",
+                safe(use.arguments) if use.arguments else None,
+                " ".join(safe(name).split()),
+            )
+        )
+        if use.result:
+            sections.append(_Section("It returned", safe(use.result)))
+        if use.error:
+            sections.append(_Section("It failed with", safe(use.error)))
+    other = Counter(
+        block.type
+        for block in content
+        if not isinstance(block, (ContentReasoning, ContentText, ContentToolUse))
+    )
+    if other:
+        counted = ", ".join(f"{count} {type}" for type, count in other.items())
+        sections.append(
+            _Section(f"The turn also holds content that is not shown here: {counted}.")
+        )
+    return sections
 
 
 _ESCAPED_REQUEST_NOTICE = (
@@ -514,11 +686,7 @@ def _call_markdown(call: ToolCall, index: int, count: int, safe: _Escaped) -> st
 
     The content is what the transcript shows (`ToolCall.view`, which
     `Model.generate` sets from the tool's viewer, or the default rendering),
-    with the call's placeholders filled in. Viewers interpolate arguments into
-    markdown unescaped, so an argument could close the viewer's code fence and
-    open an HTML comment that swallows the calls after it. A viewer's single
-    code block keeps its language and is fenced again by a fence longer than
-    any backtick run in it; any other content is shown as source.
+    with the call's placeholders filled in (see `_contained`).
     """
     content = substitute_tool_call_content(
         call.view or cast(ToolCallContent, default_tool_call_viewer(call).call),
@@ -527,13 +695,29 @@ def _call_markdown(call: ToolCall, index: int, count: int, safe: _Escaped) -> st
     header = f"**Call {index} of {count}:** {_markdown_text(call.function, safe)}"
     if content.title and content.title != call.function:
         header = f"{header} ({_markdown_text(content.title, safe)})"
+    return f"{header}\n\n{_contained(content, safe)}"
+
+
+def _contained(content: ToolCallContent, safe: Callable[[str], str]) -> str:
+    """What a tool's viewer made, as one code block it cannot close.
+
+    Viewers interpolate arguments into markdown unescaped, so an argument could
+    close the viewer's code fence and write a label of the view, or open an
+    HTML comment that swallows what follows. A viewer's single code block keeps
+    its language and is fenced again by a fence longer than any backtick run in
+    it. Any other content is shown as source.
+
+    Args:
+        content: The viewer's content, with the call's placeholders filled in.
+        safe: Makes text an agent wrote safe to display.
+    """
     block = _CODE_BLOCK.fullmatch(content.content)
     if content.format == "markdown" and block is not None:
         language, code = block.group("language").strip(), block.group("code")
     else:
         language = "markdown" if content.format == "markdown" else ""
         code = content.content
-    return f"{header}\n\n{_code_block(safe(code), language)}"
+    return _code_block(safe(code), language)
 
 
 # a viewer's single fenced code block, e.g. `code_viewer`'s and the default's
@@ -555,7 +739,11 @@ def _code_block(code: str, language: str) -> str:
 def _markdown_text(text: str, safe: _Escaped) -> str:
     # one line of literal text: markdown punctuation escaped, so a function
     # name or viewer title cannot add structure
-    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~&])", r"\\\1", _one_line(text, safe))
+    return _markdown_escaped(_one_line(text, safe))
+
+
+def _markdown_escaped(text: str) -> str:
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|<>~&])", r"\\\1", text)
 
 
 def _one_line(text: str, safe: _Escaped) -> str:
